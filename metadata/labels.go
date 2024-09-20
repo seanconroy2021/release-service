@@ -65,6 +65,9 @@ var (
 	// TenantPipelineType is the value to be used in the PipelinesTypeLabel for tenant Pipelines
 	TenantPipelineType = "tenant"
 
+	// FinalPipelineType is the value to be used in the PipelinesTypeLabel for final Pipelines
+	FinalPipelineType = "final"
+
 	// PipelinesTypeLabel is the label used to describe the type of pipeline
 	PipelinesTypeLabel = fmt.Sprintf("%s/%s", pipelinesLabelPrefix, "type")
 

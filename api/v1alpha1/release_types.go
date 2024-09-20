@@ -67,6 +67,10 @@ type ReleaseStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions"`
 
+	// FinalProcessing contains information about the release final processing
+	// +optional
+	FinalProcessing PipelineInfo `json:"finalProcessing,omitempty"`
+
 	// ManagedProcessing contains information about the release managed processing
 	// +optional
 	ManagedProcessing PipelineInfo `json:"managedProcessing,omitempty"`
@@ -165,10 +169,9 @@ type Release struct {
 	Status ReleaseStatus `json:"status,omitempty"`
 }
 
-// HasEveryPostActionExecutionFinished checks whether the Release post-actions execution has finished,
-// regardless of the result.
-func (r *Release) HasEveryPostActionExecutionFinished() bool {
-	return r.hasPhaseFinished(postActionsExecutedConditionType)
+// Has FinalPipelineProcessingFinished checks whether the Release Final Pipeline processing has finished, regardless of the result.
+func (r *Release) HasFinalPipelineProcessingFinished() bool {
+	return r.hasPhaseFinished(finalProcessedConditionType)
 }
 
 // HasManagedPipelineProcessingFinished checks whether the Release Managed Pipeline processing has finished, regardless of the result.
@@ -196,14 +199,9 @@ func (r *Release) IsAutomated() bool {
 	return r.Status.Automated
 }
 
-// IsEveryPostActionExecuted checks whether the Release post-actions were successfully executed.
-func (r *Release) IsEveryPostActionExecuted() bool {
-	return meta.IsStatusConditionTrue(r.Status.Conditions, postActionsExecutedConditionType.String())
-}
-
-// IsEachPostActionExecuting checks whether the Release post-actions are in progress.
-func (r *Release) IsEachPostActionExecuting() bool {
-	return r.isPhaseProgressing(postActionsExecutedConditionType)
+// IsFinalPipelineProcessed checks whether the Release Final Pipeline was successfully processed.
+func (r *Release) IsFinalPipelineProcessed() bool {
+	return meta.IsStatusConditionTrue(r.Status.Conditions, finalProcessedConditionType.String())
 }
 
 // IsManagedPipelineProcessed checks whether the Release Managed Pipeline was successfully processed.
@@ -214,6 +212,11 @@ func (r *Release) IsManagedPipelineProcessed() bool {
 // IsTenantPipelineProcessed checks whether the Release Tenant Pipeline was successfully processed.
 func (r *Release) IsTenantPipelineProcessed() bool {
 	return meta.IsStatusConditionTrue(r.Status.Conditions, tenantProcessedConditionType.String())
+}
+
+// IsFinalPipelineProcessing checks whether the Release Final Pipeline processing is in progress.
+func (r *Release) IsFinalPipelineProcessing() bool {
+	return r.isPhaseProgressing(finalProcessedConditionType)
 }
 
 // IsManagedPipelineProcessing checks whether the Release Managed Pipeline processing is in progress.
@@ -259,6 +262,24 @@ func (r *Release) MarkManagedPipelineProcessed() {
 	)
 }
 
+// MarkFinalPipelineProcessed marks the Release Final Pipeline as processed.
+func (r *Release) MarkFinalPipelineProcessed() {
+	if !r.IsFinalPipelineProcessing() || r.HasFinalPipelineProcessingFinished() {
+		return
+	}
+
+	r.Status.FinalProcessing.CompletionTime = &metav1.Time{Time: time.Now()}
+	conditions.SetCondition(&r.Status.Conditions, finalProcessedConditionType, metav1.ConditionTrue, SucceededReason)
+
+	go metrics.RegisterCompletedReleasePipelineProcessing(
+		r.Status.FinalProcessing.StartTime,
+		r.Status.FinalProcessing.CompletionTime,
+		SucceededReason.String(),
+		r.Status.Target,
+		metadata.FinalPipelineType,
+	)
+}
+
 // MarkTenantPipelineProcessed marks the Release Tenant Pipeline as processed.
 func (r *Release) MarkTenantPipelineProcessed() {
 	if !r.IsTenantPipelineProcessing() || r.HasTenantPipelineProcessingFinished() {
@@ -274,6 +295,27 @@ func (r *Release) MarkTenantPipelineProcessed() {
 		SucceededReason.String(),
 		r.Status.Target,
 		metadata.TenantPipelineType,
+	)
+}
+
+// MarkFinalPipelineProcessing marks the Release Final Pipeline as processing.
+func (r *Release) MarkFinalPipelineProcessing() {
+	if r.HasFinalPipelineProcessingFinished() {
+		return
+	}
+
+	if !r.IsFinalPipelineProcessing() {
+		r.Status.FinalProcessing.StartTime = &metav1.Time{Time: time.Now()}
+	}
+
+	conditions.SetCondition(&r.Status.Conditions, finalProcessedConditionType, metav1.ConditionFalse, ProgressingReason)
+
+	go metrics.RegisterNewReleasePipelineProcessing(
+		r.Status.FinalProcessing.StartTime,
+		r.Status.StartTime,
+		ProgressingReason.String(),
+		r.Status.Target,
+		metadata.FinalPipelineType,
 	)
 }
 
@@ -319,6 +361,24 @@ func (r *Release) MarkTenantPipelineProcessing() {
 	)
 }
 
+// MarkFinalPipelineProcessingFailed marks the Release Final Pipeline processing as failed.
+func (r *Release) MarkFinalPipelineProcessingFailed(message string) {
+	if !r.IsFinalPipelineProcessing() || r.HasFinalPipelineProcessingFinished() {
+		return
+	}
+
+	r.Status.FinalProcessing.CompletionTime = &metav1.Time{Time: time.Now()}
+	conditions.SetConditionWithMessage(&r.Status.Conditions, finalProcessedConditionType, metav1.ConditionFalse, FailedReason, message)
+
+	go metrics.RegisterCompletedReleasePipelineProcessing(
+		r.Status.FinalProcessing.StartTime,
+		r.Status.FinalProcessing.CompletionTime,
+		FailedReason.String(),
+		r.Status.Target,
+		metadata.FinalPipelineType,
+	)
+}
+
 // MarkManagedPipelineProcessingFailed marks the Release Managed Pipeline processing as failed.
 func (r *Release) MarkManagedPipelineProcessingFailed(message string) {
 	if !r.IsManagedPipelineProcessing() || r.HasManagedPipelineProcessingFinished() {
@@ -355,6 +415,15 @@ func (r *Release) MarkTenantPipelineProcessingFailed(message string) {
 	)
 }
 
+// MarkFinalPipelineProcessingSkipped marks the Release Final Pipeline processing as skipped.
+func (r *Release) MarkFinalPipelineProcessingSkipped() {
+	if r.HasFinalPipelineProcessingFinished() {
+		return
+	}
+
+	conditions.SetCondition(&r.Status.Conditions, finalProcessedConditionType, metav1.ConditionTrue, SkippedReason)
+}
+
 // MarkManagedPipelineProcessingSkipped marks the Release Managed Pipeline processing as skipped.
 func (r *Release) MarkManagedPipelineProcessingSkipped() {
 	if r.HasManagedPipelineProcessingFinished() {
@@ -373,53 +442,6 @@ func (r *Release) MarkTenantPipelineProcessingSkipped() {
 	conditions.SetCondition(&r.Status.Conditions, tenantProcessedConditionType, metav1.ConditionTrue, SkippedReason)
 }
 
-// MarkPostActionsExecuted marks the Release post-actions as executed.
-func (r *Release) MarkPostActionsExecuted() {
-	if !r.IsEachPostActionExecuting() || r.HasEveryPostActionExecutionFinished() {
-		return
-	}
-
-	r.Status.PostActionsExecution.CompletionTime = &metav1.Time{Time: time.Now()}
-	conditions.SetCondition(&r.Status.Conditions, postActionsExecutedConditionType, metav1.ConditionTrue, SucceededReason)
-
-	go metrics.RegisterCompletedReleasePostActionsExecuted(
-		r.Status.PostActionsExecution.StartTime,
-		r.Status.PostActionsExecution.CompletionTime,
-		SucceededReason.String(),
-	)
-}
-
-// MarkPostActionsExecuting marks the Release post-actions as executing.
-func (r *Release) MarkPostActionsExecuting(message string) {
-	if r.HasEveryPostActionExecutionFinished() {
-		return
-	}
-
-	if !r.IsEachPostActionExecuting() {
-		r.Status.PostActionsExecution.StartTime = &metav1.Time{Time: time.Now()}
-	}
-
-	conditions.SetConditionWithMessage(&r.Status.Conditions, postActionsExecutedConditionType, metav1.ConditionFalse, ProgressingReason, message)
-
-	go metrics.RegisterNewReleasePostActionsExecution()
-}
-
-// MarkPostActionsExecutionFailed marks the Release post-actions execution as failed.
-func (r *Release) MarkPostActionsExecutionFailed(message string) {
-	if !r.IsEachPostActionExecuting() || r.HasEveryPostActionExecutionFinished() {
-		return
-	}
-
-	r.Status.PostActionsExecution.CompletionTime = &metav1.Time{Time: time.Now()}
-	conditions.SetConditionWithMessage(&r.Status.Conditions, postActionsExecutedConditionType, metav1.ConditionFalse, FailedReason, message)
-
-	go metrics.RegisterCompletedReleasePostActionsExecuted(
-		r.Status.PostActionsExecution.StartTime,
-		r.Status.PostActionsExecution.CompletionTime,
-		FailedReason.String(),
-	)
-}
-
 // MarkReleased marks the Release as released.
 func (r *Release) MarkReleased() {
 	if !r.IsReleasing() || r.HasReleaseFinished() {
@@ -433,10 +455,10 @@ func (r *Release) MarkReleased() {
 		r.Status.StartTime,
 		r.Status.CompletionTime,
 		r.getPhaseReason(managedProcessedConditionType),
-		r.getPhaseReason(postActionsExecutedConditionType),
 		SucceededReason.String(),
 		r.Status.Target,
 		r.getPhaseReason(tenantProcessedConditionType),
+		r.getPhaseReason(finalProcessedConditionType),
 		r.getPhaseReason(validatedConditionType),
 	)
 }
@@ -468,9 +490,9 @@ func (r *Release) MarkReleaseFailed(message string) {
 	go metrics.RegisterCompletedRelease(
 		r.Status.StartTime,
 		r.Status.CompletionTime,
-		r.getPhaseReason(postActionsExecutedConditionType),
 		r.getPhaseReason(tenantProcessedConditionType),
 		r.getPhaseReason(managedProcessedConditionType),
+		r.getPhaseReason(finalProcessedConditionType),
 		FailedReason.String(),
 		r.Status.Target,
 		r.getPhaseReason(validatedConditionType),

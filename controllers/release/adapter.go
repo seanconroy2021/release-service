@@ -218,6 +218,24 @@ func (a *adapter) EnsureManagedCollectorsPipelineIsProcessed() (controller.Opera
 			return controller.RequeueOnErrorOrContinue(a.client.Status().Patch(a.ctx, a.release, patch))
 		}
 
+		// NEW: Create RoleBinding for collector secrets using the top-level secrets field from the CRD.
+		var collectorRoleBinding *rbac.RoleBinding
+		secretNames := releasePlanAdmission.Spec.Collectors.Secrets
+		if len(secretNames) > 0 && releasePlanAdmission.Spec.Collectors.ServiceAccountName != "" {
+			collectorRoleBinding, err = a.createRoleBindingForCollectorSecrets(
+				releasePlanAdmission.Namespace,
+				releasePlanAdmission.Spec.Collectors.ServiceAccountName,
+				secretNames,
+			)
+			if err != nil {
+				return controller.RequeueWithError(err)
+			}
+			a.logger.Info("Created collector RoleBinding",
+				"RoleBinding.Name", collectorRoleBinding.Name,
+				"Namespace", releasePlanAdmission.Namespace)
+		}
+
+		// Create the collectors PipelineRun if it doesn't exist.
 		if pipelineRun == nil {
 			pipelineRun, err = a.createManagedCollectorsPipelineRun(releasePlanAdmission)
 			if err != nil {
@@ -226,6 +244,16 @@ func (a *adapter) EnsureManagedCollectorsPipelineIsProcessed() (controller.Opera
 
 			a.logger.Info(fmt.Sprintf("Created %s Release PipelineRun", metadata.ManagedCollectorsPipelineType),
 				"PipelineRun.Name", pipelineRun.Name, "PipelineRun.Namespace", pipelineRun.Namespace)
+		}
+
+		// Optionally update the Release status with the RoleBinding reference for cleanup later.
+		if collectorRoleBinding != nil {
+			patch := client.MergeFrom(a.release.DeepCopy())
+			a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing.RoleBinding = fmt.Sprintf("%s%c%s",
+				collectorRoleBinding.Namespace, types.Separator, collectorRoleBinding.Name)
+			if err := a.client.Status().Patch(a.ctx, a.release, patch); err != nil {
+				return controller.RequeueWithError(err)
+			}
 		}
 
 		return controller.RequeueOnErrorOrContinue(a.registerManagedCollectorsProcessingData(pipelineRun))
@@ -947,6 +975,70 @@ func (a *adapter) createTenantPipelineRun(releasePlan *v1alpha1.ReleasePlan, sna
 	}
 
 	return pipelineRun, nil
+}
+
+// createRoleBindingForCollectorSecrets creates a Role and RoleBinding that grants the specified
+// serviceAccount "get" access to the given secretNames in the provided namespace.
+func (a *adapter) createRoleBindingForCollectorSecrets(namespace, serviceAccount string, secretNames []string) (*rbac.RoleBinding, error) {
+	// Create a Role that grants "get" access to the specific secrets.
+	role := &rbac.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-collector-secrets-", a.release.Name),
+			Namespace:    namespace,
+			Labels: map[string]string{
+				metadata.ReleaseNameLabel:       a.release.Name,
+				metadata.ReleaseNamespaceLabel:  a.release.Namespace,
+				"appstudio.redhat.com/pipeline": "collectors",
+			},
+		},
+		Rules: []rbac.PolicyRule{
+			{
+				APIGroups:     []string{""}, // core API group for secrets
+				Resources:     []string{"secrets"},
+				ResourceNames: secretNames,
+				Verbs:         []string{"get"},
+			},
+		},
+	}
+
+	if err := a.client.Create(a.ctx, role); err != nil {
+		return nil, err
+	}
+
+	// Create a RoleBinding that binds the Role to the collector's serviceAccount.
+	roleBinding := &rbac.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-collector-secrets-rb-", a.release.Name),
+			Namespace:    namespace,
+			Labels:       role.Labels, // use same labels for traceability
+		},
+		RoleRef: rbac.RoleRef{
+			APIGroup: rbac.GroupName,
+			Kind:     "Role",
+			Name:     role.Name, // bind to the Role we just created
+		},
+		Subjects: []rbac.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      serviceAccount,
+				Namespace: namespace,
+			},
+		},
+	}
+
+	// Set owner reference so that if the Release is deleted the RoleBinding gets cleaned up,
+	// provided they are in the same namespace.
+	if namespace == a.release.Namespace {
+		if err := ctrl.SetControllerReference(a.release, roleBinding, a.client.Scheme()); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := a.client.Create(a.ctx, roleBinding); err != nil {
+		return nil, err
+	}
+
+	return roleBinding, nil
 }
 
 // createRoleBindingForClusterRole creates a RoleBinding that binds the serviceAccount from the passed

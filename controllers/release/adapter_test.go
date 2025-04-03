@@ -650,6 +650,44 @@ var _ = Describe("Release adapter", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(adapter.client.Delete(adapter.ctx, pipelineRun)).To(Succeed())
 		})
+
+		It("should create a collector RoleBinding and update the release status when collectors secrets are defined", func() {
+			// Create a copy of the ReleasePlanAdmission and add collectors with secrets.
+			newReleasePlanAdmission := releasePlanAdmission.DeepCopy()
+			newReleasePlanAdmission.Spec.Collectors = &v1alpha1.Collectors{
+				Items: []v1alpha1.CollectorItem{
+					{
+						Name:   "foo",
+						Type:   "bar",
+						Params: []v1alpha1.Param{},
+					},
+				},
+				Secrets:            []string{"secret-1", "secret-2"},
+				ServiceAccountName: "release-service-account",
+			}
+
+			// Set up the mocked context so that the adapter gets the updated ReleasePlanAdmission.
+			adapter.ctx = toolkit.GetMockedContext(ctx, []toolkit.MockData{
+				{
+					ContextKey: loader.ReleasePlanAdmissionContextKey,
+					Resource:   newReleasePlanAdmission,
+				},
+			})
+
+			// Mark tenant collectors processing as skipped so that the managed collectors logic will run.
+			adapter.release.MarkTenantCollectorsPipelineProcessingSkipped()
+
+			// Call the function.
+			result, err := adapter.EnsureManagedCollectorsPipelineIsProcessed()
+			Expect(err).NotTo(HaveOccurred())
+			// Depending on your reconciliation logic, the function should eventually requeue until processing is complete.
+			// For the purposes of this test, we expect it not to cancel.
+			Expect(result.CancelRequest).To(BeFalse())
+
+			// Check that the release status for managed collectors processing now has a RoleBinding reference.
+			rbRef := adapter.release.Status.CollectorsProcessing.ManagedCollectorsProcessing.RoleBinding
+			Expect(rbRef).NotTo(BeEmpty(), "Expected collector RoleBinding reference to be set in the release status")
+		})
 	})
 
 	When("EnsureManagedPipelineIsProcessed is called", func() {

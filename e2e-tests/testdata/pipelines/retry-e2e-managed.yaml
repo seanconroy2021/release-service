@@ -1,0 +1,230 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: retry-e2e-managed
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: >-
+    Managed pipeline for retry e2e tests. Reads failMode and failOnTask
+    from RPA spec.data to trigger OOM, task-timeout, pipeline-timeout, or
+    error failures on a specific task.
+    failMode values: none | error | oom | oom-always | task-timeout | pipeline-timeout
+  params:
+    - name: release
+      type: string
+    - name: releasePlan
+      type: string
+    - name: releasePlanAdmission
+      type: string
+    - name: releaseServiceConfig
+      type: string
+    - name: snapshot
+      type: string
+    - name: enterpriseContractPolicy
+      type: string
+
+  tasks:
+    # collect-data reads failMode and failOnTask from the RPA spec.data
+    # and exposes them as results for downstream tasks.
+    #
+    # failMode values:
+    #   none             - succeed immediately
+    #   error            - exit 1 (not retried)
+    #   oom              - exit 137; passes once OOM mitigation raises the limit
+    #   task-timeout     - sleep past task-01's 1m timeout; use failOnTask=task-01
+    #   pipeline-timeout - sleep past the RPA pipeline timeout; use failOnTask=task-02
+    #                      task-02 has no task timeout so only pipeline fires
+    - name: collect-data
+      params:
+        - name: releasePlanAdmission
+          value: "$(params.releasePlanAdmission)"
+      taskSpec:
+        params:
+          - name: releasePlanAdmission
+            type: string
+        results:
+          - name: failMode
+            type: string
+          - name: failOnTask
+            type: string
+        steps:
+          - name: collect-data
+            image: quay.io/konflux-ci/release-service-utils@sha256:850118bc6eda4ca3f98ef1e53109164f64a0945a6ac0942f908b7e106f50775c
+            computeResources:
+              requests:
+                memory: 64Mi
+                cpu: 50m
+              limits:
+                memory: 64Mi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              DATA=$(get-resource releasePlanAdmission "$(params.releasePlanAdmission)" \
+                | jq -r '.spec.data // "{}"')
+
+              FAIL_MODE=$(echo "${DATA}"    | jq -r '.failMode    // "none"')
+              FAIL_ON_TASK=$(echo "${DATA}" | jq -r '.failOnTask  // "task-01"')
+
+              echo "failMode=${FAIL_MODE}  failOnTask=${FAIL_ON_TASK}"
+              echo -n "${FAIL_MODE}"    > "$(results.failMode.path)"
+              echo -n "${FAIL_ON_TASK}" > "$(results.failOnTask.path)"
+
+    # task-01 has a 1m per-task timeout and two steps.
+    # task-01-step-01 has the failure logic (OOM, task-timeout, error).
+    # Only triggers when failOnTask=task-01.
+    - name: task-01
+      timeout: "1m"
+      runAfter:
+        - collect-data
+      params:
+        - name: failMode
+          value: "$(tasks.collect-data.results.failMode)"
+        - name: failOnTask
+          value: "$(tasks.collect-data.results.failOnTask)"
+      taskSpec:
+        params:
+          - name: failMode
+            type: string
+          - name: failOnTask
+            type: string
+        steps:
+          # step-01: the memory limit (64Mi) is intentionally low so that when
+          # failMode=oom the cgroup check fails. After the 2x OOM mitigation
+          # raises the limit to 128Mi the threshold (100Mi) is cleared.
+          # For task-timeout the 90s sleep outlasts the 1m task timeout;
+          # the +15m mitigation increment on retry gives it enough room.
+          - name: task-01-step-01
+            image: quay.io/konflux-ci/release-service-utils@sha256:850118bc6eda4ca3f98ef1e53109164f64a0945a6ac0942f908b7e106f50775c
+            computeResources:
+              requests:
+                memory: 64Mi
+                cpu: 100m
+              limits:
+                memory: 64Mi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              FAIL_MODE="$(params.failMode)"
+              FAIL_ON_TASK="$(params.failOnTask)"
+
+              # pipeline-timeout runs in both task-01 and task-02 regardless of failOnTask
+              # so that their combined sleep (50s + 50s = 100s) exceeds the 90s pipeline
+              # timeout set by the RPA, triggering PipelineRunTimeout.
+              case "${FAIL_MODE}" in
+                pipeline-timeout)
+                  echo "task-01-step-01: pipeline-timeout — sleeping 50s"
+                  sleep 50
+                  exit 0
+                  ;;
+              esac
+
+              [[ "${FAIL_ON_TASK}" != "task-01" ]] && exit 0
+
+              echo "task-01-step-01: failMode=${FAIL_MODE}"
+              case "${FAIL_MODE}" in
+                error)
+                  exit 1
+                  ;;
+                oom)
+                  LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+                  THRESHOLD=104857600  # 100 Mi — between initial 64Mi and mitigated 128Mi
+                  if [[ "${LIMIT}" != "max" ]] && (( LIMIT < THRESHOLD )); then
+                    echo "limit ${LIMIT} < ${THRESHOLD}: filling memory past limit to trigger kernel OOMKill"
+                    # Capture 150 Mi into a bash variable; the kernel OOM-kills this
+                    # process when the limit is exceeded, setting containerState to OOMKilled.
+                    x=$(dd if=/dev/zero bs=1M count=150 status=none | tr '\0' 'a')
+                    echo "${#x}"
+                  fi
+                  echo "limit ${LIMIT} sufficient"
+                  ;;
+                oom-always)
+                  # Fill memory unconditionally so every attempt is OOM-killed,
+                  # exhausting all retries regardless of the mitigated memory limit.
+                  x=$(dd if=/dev/zero bs=1M count=4096 status=none | tr '\0' 'a')
+                  echo "${#x}"
+                  ;;
+                task-timeout)
+                  echo "sleeping 90s"
+                  sleep 90
+                  ;;
+              esac
+
+          - name: task-01-step-02
+            image: quay.io/konflux-ci/release-service-utils@sha256:850118bc6eda4ca3f98ef1e53109164f64a0945a6ac0942f908b7e106f50775c
+            computeResources:
+              requests:
+                memory: 32Mi
+                cpu: 50m
+              limits:
+                memory: 32Mi
+            script: |
+              #!/usr/bin/env bash
+              echo "task-01-step-02: complete"
+
+    # task-02 also has a 1m per-task timeout so task-timeout scenarios can target either task.
+    # With no task deadline, only the PipelineRun-level timeout (set short via the
+    # RPA Timeouts.Pipeline field) can fire. The +30m pipeline mitigation on retry
+    # gives the 90s sleep enough room to complete. Also handles oom and error when
+    # failOnTask=task-02.
+    - name: task-02
+      timeout: "1m"
+      runAfter:
+        - task-01
+      params:
+        - name: failMode
+          value: "$(tasks.collect-data.results.failMode)"
+        - name: failOnTask
+          value: "$(tasks.collect-data.results.failOnTask)"
+      taskSpec:
+        params:
+          - name: failMode
+            type: string
+          - name: failOnTask
+            type: string
+        steps:
+          - name: task-02-step-01
+            image: quay.io/konflux-ci/release-service-utils@sha256:850118bc6eda4ca3f98ef1e53109164f64a0945a6ac0942f908b7e106f50775c
+            computeResources:
+              requests:
+                memory: 64Mi
+                cpu: 100m
+              limits:
+                memory: 64Mi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              FAIL_MODE="$(params.failMode)"
+              FAIL_ON_TASK="$(params.failOnTask)"
+
+              # pipeline-timeout runs in both task-01 and task-02 regardless of failOnTask.
+              case "${FAIL_MODE}" in
+                pipeline-timeout)
+                  echo "task-02-step-01: pipeline-timeout — sleeping 50s"
+                  sleep 50
+                  exit 0
+                  ;;
+              esac
+
+              [[ "${FAIL_ON_TASK}" != "task-02" ]] && { echo "task-02: complete"; exit 0; }
+
+              echo "task-02-step-01: failMode=${FAIL_MODE}"
+              case "${FAIL_MODE}" in
+                error)
+                  exit 1
+                  ;;
+                oom)
+                  LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+                  THRESHOLD=104857600  # 100 Mi
+                  if [[ "${LIMIT}" != "max" ]] && (( LIMIT < THRESHOLD )); then
+                    echo "limit ${LIMIT} < ${THRESHOLD}: OOMKill"
+                    exit 137
+                  fi
+                  echo "limit ${LIMIT} sufficient"
+                  ;;
+              esac
